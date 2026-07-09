@@ -43,6 +43,102 @@ export async function POST(req: Request) {
       return Response.json({ error: "Messages are required" }, { status: 400 });
     }
 
+    // Try Groq API first (if available)
+    const groqApiKey = process.env.GROQ_API_KEY;
+    if (groqApiKey) {
+      const groqModel = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+      const systemMessage = `${SYSTEM_PROMPT}\n\nThe student is in Class ${classLevel}. Tailor your explanations to their grade level.`;
+
+      const convertedMessages = messages.map((msg: any) => ({
+        role: msg.role === "assistant" ? "assistant" : "user",
+        content: getMessageText(msg),
+      }));
+
+      try {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${groqApiKey}`,
+          },
+          body: JSON.stringify({
+            model: groqModel,
+            messages: [
+              { role: "system", content: systemMessage },
+              ...convertedMessages,
+            ],
+            stream: true,
+            temperature: 0.7,
+            max_tokens: 2048,
+          }),
+        });
+
+        if (response.ok && response.body) {
+          console.log(`✅ Using Groq (${groqModel})`);
+          
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          const encoder = new TextEncoder();
+          let accumulated = "";
+
+          const stream = new ReadableStream({
+            async start(controller) {
+              let buffer = "";
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split("\n");
+                  
+                  buffer = lines.pop() || "";
+
+                  for (const line of lines) {
+                    const cleanLine = line.trim();
+                    if (!cleanLine) continue;
+                    if (cleanLine === "data: [DONE]") continue;
+
+                    if (cleanLine.startsWith("data: ")) {
+                      try {
+                        const jsonStr = cleanLine.slice(6);
+                        const data = JSON.parse(jsonStr);
+                        const content = data.choices?.[0]?.delta?.content || "";
+                        if (content) {
+                          accumulated += content;
+                          const escaped = accumulated.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+                          const chunk = `0:"${escaped}"\n`;
+                          controller.enqueue(encoder.encode(chunk));
+                        }
+                      } catch (e) {
+                        // ignore parse errors
+                      }
+                    }
+                  }
+                }
+              } catch (streamError) {
+                console.error("Groq stream error:", streamError);
+              } finally {
+                controller.close();
+              }
+            }
+          });
+
+          return new Response(stream, {
+            headers: {
+              "Content-Type": "text/plain; charset=utf-8",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive",
+            },
+          });
+        } else {
+          console.error("Groq API error:", await response.text());
+        }
+      } catch (groqError) {
+        console.error("⚠️ Groq not available, falling back:", groqError);
+      }
+    }
+
     // Try Ollama first (if available)
     const ollamaUrl = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
     const ollamaModel = process.env.OLLAMA_MODEL || "mistral";
